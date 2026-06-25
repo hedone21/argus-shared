@@ -234,6 +234,15 @@ pub enum EngineCommand {
     /// Dynamically transition KV cache quantization bits.
     #[serde(rename = "kv.quant_dynamic")]
     KvQuantDynamic { target_bits: u8 },
+    /// Re-encode the resident KV cache to a different per-layer storage format
+    /// (W-FORMAT-HET L1-runtime). `format` is an engine-registered KV format name
+    /// (`"f16"` / `"q4_0"` / `"f32"` / a `.so` format). Unlike `KvQuantDynamic`
+    /// (which retargets the quant-window cache's bit-width), this drives the
+    /// `StandardFormat` re-encode path — an in-place precision downgrade of the
+    /// already-resident KV. Host-resident typed-floor layers only; device/opaque
+    /// layers are a no-op until GPU re-encode lands.
+    #[serde(rename = "kv.reencode_format")]
+    KvReencodeFormat { format: String },
     /// Offload a fraction of KV cache to disk (LRU prefix).
     /// `ratio`: 0.0~1.0, fraction of oldest tokens to swap out.
     /// Paired with `RestoreDefaults` for recall.
@@ -645,6 +654,25 @@ mod tests {
             EngineCommand::KvQuantDynamic { target_bits } => assert_eq!(target_bits, 4),
             _ => panic!("Expected KvQuantDynamic"),
         }
+    }
+
+    #[test]
+    fn test_engine_command_serde_kv_reencode_format() {
+        let cmd = EngineCommand::KvReencodeFormat {
+            format: "q4_0".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"kv.reencode_format\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::KvReencodeFormat { format } => assert_eq!(format, "q4_0"),
+            _ => panic!("Expected KvReencodeFormat"),
+        }
+        // discriminant-only same_kind ignores the format payload.
+        assert!(cmd.same_kind(&EngineCommand::KvReencodeFormat {
+            format: "f16".to_string()
+        }));
+        assert!(!cmd.same_kind(&EngineCommand::KvQuantDynamic { target_bits: 4 }));
     }
 
     #[test]
