@@ -5,10 +5,14 @@ Shared IPC protocol types for the **Argus** on-device LLM inference framework.
 This crate defines the message types exchanged between the two Argus
 processes over Unix Domain Socket / TCP / D-Bus (serde JSON):
 
-- **`ManagerMessage` / `EngineCommand`** — resource manager → engine
-  (evict KV cache, switch backend, throttle, set tensor-partition ratio, ...).
-- **`EngineMessage`** — engine → manager (capability advertisement, heartbeat
-  with live throughput, command responses, QCF estimates, ...).
+- **`ManagerMessage` / `EngineCommand`** — manager → engine. One directive type
+  carrying a KV-cache byte budget plus the lifecycle commands. The contract never
+  names a KV cache technique: the manager sets the budget, the engine picks how to
+  reach it.
+- **`EngineMessage`** — engine → manager: a heartbeat (KV cache size, TBT, phase)
+  and a per-directive response. A command the engine cannot execute is answered
+  `Rejected`, which is how the manager learns the engine's action set — there is no
+  separate capability exchange.
 
 It has no dependency on the engine or manager crates, so both can depend on it
 without a dependency cycle.
