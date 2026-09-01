@@ -133,9 +133,23 @@ fn de_budget<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
 pub enum EngineCommand {
     /// Shrink the resident KV cache to `budget`.
     ///
-    /// `budget` is the fraction of the **uncompressed KV byte** footprint to retain, in
-    /// `(0.0, 1.0]`. It is not a token count and not a token ratio; the denominator is
-    /// [`EngineStatus::kv_cache_budget_bytes`].
+    /// `budget` is the fraction of the **uncompressed footprint of the current context** to
+    /// retain, in `(0.0, 1.0]` — what the cache would hold if nothing had ever been
+    /// compressed. It is not a fraction of what is *resident*: against that denominator a
+    /// repeated budget would compound rather than restate, and a Manager whose ramp dithers
+    /// would ratchet the cache toward nothing.
+    ///
+    /// Two consequences follow, and both are load-bearing:
+    /// - The command is **idempotent**. Sending `0.3` twice names one state, not two.
+    /// - A **loosened** budget asks for a state the cache is already in, because eviction
+    ///   does not run backwards. The Engine answers `Ok` without doing any work — it does
+    ///   not even score its candidates. Giving the cache back is what `RestoreDefaults` is
+    ///   for.
+    ///
+    /// The denominator is *not* [`EngineStatus::kv_cache_budget_bytes`], which is
+    /// capacity-sized (`max_seq_len` × bytes-per-token) and so is a **ceiling** on the
+    /// footprint rather than the current context's: on a short conversation a budget taken
+    /// against it would evict nothing at all.
     ///
     /// Which technique meets the budget is the Engine's decision, so this command carries
     /// no technique name and gains no field when the Engine's technique set changes.
