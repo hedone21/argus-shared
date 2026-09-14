@@ -127,20 +127,19 @@ fn de_budget<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
     Ok(v)
 }
 
-/// Reject a share that is not a usable fraction, at the point of deserialization. Same
-/// rationale as [`de_budget`], except `0.0` is a legal value here — it is how a Manager
-/// releases the share without a separate command.
-fn de_share<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+/// Largest layer interval a Manager may ask for. The interval counts decoder blocks, and no
+/// model this contract serves has more than 64 of them — a larger value would never fire.
+pub const GPU_YIELD_EVERY_MAX: u32 = 64;
+
+/// Reject a yield interval outside `0..=GPU_YIELD_EVERY_MAX`, at the point of
+/// deserialization. `0` is legal — it is how a Manager turns yielding off without a separate
+/// command. Negative and fractional values already fail as `u32`.
+fn de_every<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     use serde::de::Error;
-    let v = f32::deserialize(d)?;
-    if !v.is_finite() {
+    let v = u32::deserialize(d)?;
+    if v > GPU_YIELD_EVERY_MAX {
         return Err(D::Error::custom(format!(
-            "foreground must be finite, got {v}"
-        )));
-    }
-    if !(0.0..=1.0).contains(&v) {
-        return Err(D::Error::custom(format!(
-            "foreground must be in [0.0, 1.0], got {v}"
+            "every must be in 0..={GPU_YIELD_EVERY_MAX}, got {v}"
         )));
     }
     Ok(v)
@@ -188,16 +187,15 @@ pub enum EngineCommand {
     /// Resume from suspended.
     Resume,
 
-    /// Give the foreground application a share of the GPU. `foreground` is the intent in
-    /// `[0.0, 1.0]`: `0.0` releases, anything above asks the engine to yield GPU time between
-    /// its own kernels. How much yielding that means is the engine's decision (the ladder
-    /// lives in `yield_policy::every_for_share`), so this command carries no layer interval
-    /// and gains no field when the ladder gains rungs. Idempotent; `RestoreDefaults` releases
-    /// it.
-    #[serde(rename = "gpu.share")]
-    GpuShare {
-        #[serde(deserialize_with = "de_share")]
-        foreground: f32,
+    /// Yield the GPU to other applications every `every` decoder blocks during decode:
+    /// the engine drains its queue and gives up its time slice after each such block. `0`
+    /// turns yielding off. The interval is the Manager's decision — the rungs it steps
+    /// through live in its policy, where they can be tuned against measurements. Idempotent;
+    /// `RestoreDefaults` returns it to the engine's configured default.
+    #[serde(rename = "gpu.yield")]
+    GpuYield {
+        #[serde(deserialize_with = "de_every")]
+        every: u32,
     },
 }
 
@@ -264,31 +262,30 @@ mod tests {
     }
 
     #[test]
-    fn gpu_share_wire_tag_is_stable() {
-        let json = serde_json::to_string(&EngineCommand::GpuShare { foreground: 1.0 }).unwrap();
-        assert!(json.contains("\"type\":\"gpu.share\""), "{json}");
-        assert!(json.contains("\"foreground\":1.0"), "{json}");
+    fn gpu_yield_wire_tag_is_stable() {
+        let json = serde_json::to_string(&EngineCommand::GpuYield { every: 4 }).unwrap();
+        assert!(json.contains("\"type\":\"gpu.yield\""), "{json}");
+        assert!(json.contains("\"every\":4"), "{json}");
         assert_eq!(
-            roundtrip(&EngineCommand::GpuShare { foreground: 1.0 }),
-            EngineCommand::GpuShare { foreground: 1.0 }
+            roundtrip(&EngineCommand::GpuYield { every: 4 }),
+            EngineCommand::GpuYield { every: 4 }
         );
     }
 
-    /// `foreground` is an intent, not a layer interval — `0.0` is a legal release, unlike
-    /// `budget` where the same value is refused.
+    /// `0` is a legal release, unlike `budget` where the same value is refused.
     #[test]
-    fn share_out_of_range_is_refused() {
-        for bad in ["-0.1", "1.5", "null"] {
-            let json = format!("{{\"type\":\"gpu.share\",\"foreground\":{bad}}}");
+    fn yield_every_out_of_range_is_refused() {
+        for bad in ["65", "-1", "2.5", "null"] {
+            let json = format!("{{\"type\":\"gpu.yield\",\"every\":{bad}}}");
             assert!(
                 serde_json::from_str::<EngineCommand>(&json).is_err(),
-                "foreground {bad} should not deserialize"
+                "every {bad} should not deserialize"
             );
         }
-        for good in ["0.0", "0.5", "1.0"] {
-            let json = format!("{{\"type\":\"gpu.share\",\"foreground\":{good}}}");
+        for good in ["0", "2", "64"] {
+            let json = format!("{{\"type\":\"gpu.yield\",\"every\":{good}}}");
             serde_json::from_str::<EngineCommand>(&json)
-                .unwrap_or_else(|e| panic!("foreground {good} should deserialize: {e}"));
+                .unwrap_or_else(|e| panic!("every {good} should deserialize: {e}"));
         }
     }
 
