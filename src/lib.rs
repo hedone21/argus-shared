@@ -127,6 +127,25 @@ fn de_budget<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
     Ok(v)
 }
 
+/// Reject a share that is not a usable fraction, at the point of deserialization. Same
+/// rationale as [`de_budget`], except `0.0` is a legal value here — it is how a Manager
+/// releases the share without a separate command.
+fn de_share<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    use serde::de::Error;
+    let v = f32::deserialize(d)?;
+    if !v.is_finite() {
+        return Err(D::Error::custom(format!(
+            "foreground must be finite, got {v}"
+        )));
+    }
+    if !(0.0..=1.0).contains(&v) {
+        return Err(D::Error::custom(format!(
+            "foreground must be in [0.0, 1.0], got {v}"
+        )));
+    }
+    Ok(v)
+}
+
 /// Manager → Engine command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -168,6 +187,18 @@ pub enum EngineCommand {
 
     /// Resume from suspended.
     Resume,
+
+    /// Give the foreground application a share of the GPU. `foreground` is the intent in
+    /// `[0.0, 1.0]`: `0.0` releases, anything above asks the engine to yield GPU time between
+    /// its own kernels. How much yielding that means is the engine's decision (the ladder
+    /// lives in `yield_policy::every_for_share`), so this command carries no layer interval
+    /// and gains no field when the ladder gains rungs. Idempotent; `RestoreDefaults` releases
+    /// it.
+    #[serde(rename = "gpu.share")]
+    GpuShare {
+        #[serde(deserialize_with = "de_share")]
+        foreground: f32,
+    },
 }
 
 /// Batch of commands from Manager to Engine.
@@ -232,6 +263,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gpu_share_wire_tag_is_stable() {
+        let json = serde_json::to_string(&EngineCommand::GpuShare { foreground: 1.0 }).unwrap();
+        assert!(json.contains("\"type\":\"gpu.share\""), "{json}");
+        assert!(json.contains("\"foreground\":1.0"), "{json}");
+        assert_eq!(
+            roundtrip(&EngineCommand::GpuShare { foreground: 1.0 }),
+            EngineCommand::GpuShare { foreground: 1.0 }
+        );
+    }
+
+    /// `foreground` is an intent, not a layer interval — `0.0` is a legal release, unlike
+    /// `budget` where the same value is refused.
+    #[test]
+    fn share_out_of_range_is_refused() {
+        for bad in ["-0.1", "1.5", "null"] {
+            let json = format!("{{\"type\":\"gpu.share\",\"foreground\":{bad}}}");
+            assert!(
+                serde_json::from_str::<EngineCommand>(&json).is_err(),
+                "foreground {bad} should not deserialize"
+            );
+        }
+        for good in ["0.0", "0.5", "1.0"] {
+            let json = format!("{{\"type\":\"gpu.share\",\"foreground\":{good}}}");
+            serde_json::from_str::<EngineCommand>(&json)
+                .unwrap_or_else(|e| panic!("foreground {good} should deserialize: {e}"));
+        }
+    }
+
     /// A non-finite float never survives serialization, so validation on the receiving
     /// side cannot be the only guard — this pins the mechanism so the comment on
     /// [`de_budget`] stays true.
@@ -251,9 +311,7 @@ mod tests {
                 EngineCommand::Suspend,
             ],
         };
-        let back = match roundtrip(&ManagerMessage::Directive(d)) {
-            ManagerMessage::Directive(d) => d,
-        };
+        let ManagerMessage::Directive(back) = roundtrip(&ManagerMessage::Directive(d));
         assert_eq!(back.seq_id, 7);
         assert_eq!(back.commands.len(), 2);
         assert_eq!(back.commands[0], EngineCommand::KvCompress { budget: 0.5 });
