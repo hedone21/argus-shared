@@ -19,6 +19,11 @@
 //! [`CommandResult::Rejected`], and that is how the Manager learns what the Engine can
 //! do. A separate capability message would be a second thing to keep in sync, and it
 //! could not describe a capability that comes and goes with configuration.
+//!
+//! Two commands are GPU levers, and each names only what it asks of the GPU:
+//! `gpu.yield` gives the GPU's time slice to other applications, and `gpu.offload`
+//! moves part of the Engine's GPU work onto the CPU. How the work is split is the
+//! Engine's decision.
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -178,7 +183,7 @@ pub enum EngineCommand {
     },
 
     /// Release everything a previous command applied, returning the engine to its
-    /// configured defaults.
+    /// configured defaults. GPU offload returns to the state the engine started in.
     RestoreDefaults,
 
     /// Suspend inference.
@@ -197,6 +202,14 @@ pub enum EngineCommand {
         #[serde(deserialize_with = "de_every")]
         every: u32,
     },
+
+    /// Turn on or off moving part of the engine's GPU work onto the CPU during decode.
+    /// The Manager decides only whether to offload; how much, and how the work is
+    /// split, is the Engine's decision. An Engine that did not prepare for offload at
+    /// start answers `Rejected`. Idempotent; `RestoreDefaults` returns it to the state
+    /// the engine started in.
+    #[serde(rename = "gpu.offload")]
+    GpuOffload { on: bool },
 }
 
 /// Batch of commands from Manager to Engine.
@@ -270,6 +283,32 @@ mod tests {
             roundtrip(&EngineCommand::GpuYield { every: 4 }),
             EngineCommand::GpuYield { every: 4 }
         );
+    }
+
+    #[test]
+    fn gpu_offload_wire_tag_is_stable() {
+        for on in [true, false] {
+            let cmd = EngineCommand::GpuOffload { on };
+            let json = serde_json::to_string(&cmd).unwrap();
+            assert_eq!(json, format!("{{\"type\":\"gpu.offload\",\"on\":{on}}}"));
+            assert_eq!(roundtrip(&cmd), cmd);
+        }
+    }
+
+    /// A missing or non-boolean `on` must not quietly become one of the two states.
+    #[test]
+    fn gpu_offload_requires_bool() {
+        for bad in [
+            r#"{"type":"gpu.offload"}"#,
+            r#"{"type":"gpu.offload","on":null}"#,
+            r#"{"type":"gpu.offload","on":1}"#,
+            r#"{"type":"gpu.offload","on":"true"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<EngineCommand>(bad).is_err(),
+                "{bad} should not deserialize"
+            );
+        }
     }
 
     /// `0` is a legal release, unlike `budget` where the same value is refused.
